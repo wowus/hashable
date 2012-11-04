@@ -1,5 +1,8 @@
 language: haskell
 install:
+    - cabal install criterion
+    - cabal install test-framework
+    - cabal install test-framework-quickcheck2
     - cabal configure --enable-tests --enable-benchmarks
     - cabal build
     - cabal haddock
