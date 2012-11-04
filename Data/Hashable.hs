@@ -1,5 +1,9 @@
 {-# LANGUAGE BangPatterns, CPP, ForeignFunctionInterface, MagicHash,
              UnliftedFFITypes #-}
+#if __GLASGOW_HASKELL__ >= 702
+{-# LANGUAGE TypeOperators, FlexibleContexts, DefaultSignatures #-}
+#define GENERIC
+#endif
 
 ------------------------------------------------------------------------
 -- |
@@ -99,6 +103,10 @@ import GHC.Fingerprint.Type(Fingerprint(..))
 import Data.Typeable.Internal(TypeRep(..))
 #endif
 
+#ifdef GENERIC
+import GHC.Generics
+#endif
+
 #include "MachDeps.h"
 
 infixl 0 `combine`, `hashWithSalt`
@@ -115,7 +123,16 @@ defaultSalt = 2166136261
 
 -- | The class of types that can be converted to a hash value.
 --
--- Minimal implementation: 'hash' or 'hashWithSalt'.
+-- Minimal implementation: 'hashWithSalt'.
+--
+-- If your data type derives from 'Generic', you need not supply an
+-- implementation of 'hashWithSalt'. Instead, just do:
+--
+-- > data Bar a = Bar0 | Bar1 a | Bar2 (Bar a) deriving Generic
+-- >
+-- > instance Hashable a => Hashable (Bar a)
+--
+-- And an instance will be automatically generated for you.
 class Hashable a where
     -- | Return a hash value for the argument.
     --
@@ -149,35 +166,85 @@ class Hashable a where
     -- the additional requirement that any instance that defines
     -- 'hashWithSalt' must make use of the salt in its implementation.
     hashWithSalt :: Int -> a -> Int
-    hashWithSalt salt x = salt `combine` hash x
 
-instance Hashable () where hash _ = 0
+#ifdef GENERIC
+    default hashWithSalt :: (Generic a, GHashable (Rep a)) => Int -> a -> Int
+    hashWithSalt salt = gHashWithSalt salt . from
+#endif
+
+#ifdef GENERIC
+
+-- | Hidden internal type class for generic Hashable instances.
+class GHashable f where
+    gHashWithSalt :: Int -> f a -> Int
+
+instance GHashable U1 where
+    gHashWithSalt = const
+    {-# INLINE gHashWithSalt #-}
+
+instance Hashable a => GHashable (K1 i a) where
+    gHashWithSalt salt = hashWithSalt salt . unK1
+    {-# INLINE gHashWithSalt #-}
+
+instance GHashable a => GHashable (M1 i c a) where
+    gHashWithSalt salt = gHashWithSalt salt . unM1
+    {-# INLINE gHashWithSalt #-}
+
+instance (GHashable a, GHashable b) => GHashable (a :*: b) where
+    gHashWithSalt salt (x :*: y) = gHashWithSalt (gHashWithSalt salt x) y
+    {-# INLINE gHashWithSalt #-}
+
+instance (GHashable a, GHashable b) => GHashable (a :+: b) where
+    gHashWithSalt salt (L1 x) = gHashWithSalt (combine salt 0) x
+    gHashWithSalt salt (R1 x) = gHashWithSalt (combine salt distinguisher) x
+    {-# INLINE gHashWithSalt #-}
+
+#endif
+
+instance Hashable () where hashWithSalt = const
 
 instance Hashable Ordering where
-    hash LT = 0xd035ce52b17a94b4
-    hash EQ = 0x65886b5361a4db93
-    hash GT = 0x731e59547a3d470d
+    hashWithSalt salt LT = combine salt 0xd035ce52b17a94b4
+    hashWithSalt salt EQ = combine salt 0x65886b5361a4db93
+    hashWithSalt salt GT = combine salt 0x731e59547a3d470d
 
-instance Hashable Bool where hash x = case x of { True -> 1; False -> 0 }
+instance Hashable Bool where
+    hashWithSalt salt = combine salt . fromEnum
 
-instance Hashable Int where hash = id
-instance Hashable Int8 where hash = fromIntegral
-instance Hashable Int16 where hash = fromIntegral
-instance Hashable Int32 where hash = fromIntegral
+instance Hashable Int where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Int8 where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Int16 where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Int32 where
+    hashWithSalt salt = combine salt . fromIntegral
+
 instance Hashable Int64 where
-    hash n
-        | bitSize (undefined :: Int) == 64 = fromIntegral n
-        | otherwise = fromIntegral (fromIntegral n `xor`
-                                   (fromIntegral n `shiftR` 32 :: Word64))
+    hashWithSalt salt n
+        | bitSize (undefined :: Int) == 64 = combine salt $ fromIntegral n
+        | otherwise = combine salt $ fromIntegral (fromIntegral n `xor`
+                                                    (fromIntegral n `shiftR` 32 :: Word64))
 
-instance Hashable Word where hash = fromIntegral
-instance Hashable Word8 where hash = fromIntegral
-instance Hashable Word16 where hash = fromIntegral
-instance Hashable Word32 where hash = fromIntegral
+instance Hashable Word where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Word8 where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Word16 where
+    hashWithSalt salt = combine salt . fromIntegral
+
+instance Hashable Word32 where
+    hashWithSalt salt = combine salt . fromIntegral
+
 instance Hashable Word64 where
-    hash n
-        | bitSize (undefined :: Int) == 64 = fromIntegral n
-        | otherwise = fromIntegral (n `xor` (n `shiftR` 32))
+    hashWithSalt salt n
+        | bitSize (undefined :: Int) == 64 = combine salt $ fromIntegral n
+        | otherwise = combine salt $ fromIntegral (n `xor` (n `shiftR` 32))
 
 instance Hashable Integer where
 #if defined(__GLASGOW_HASKELL__) && defined(VERSION_integer_gmp)
@@ -203,22 +270,23 @@ instance (Integral a, Hashable a) => Hashable (Ratio a) where
     hashWithSalt s a = s `hashWithSalt` numerator a `hashWithSalt` denominator a
 
 instance Hashable Float where
-    hash x
+    hashWithSalt salt x
         | isIEEE x =
             assert (sizeOf x >= sizeOf (0::Word32) &&
                     alignment x >= alignment (0::Word32)) $
-            hash ((unsafePerformIO $ with x $ peek . castPtr) :: Word32)
-        | otherwise = hash (show x)
+            hashWithSalt salt ((unsafePerformIO $ with x $ peek . castPtr) :: Word32)
+        | otherwise = hashWithSalt salt $ show x
 
 instance Hashable Double where
-    hash x
+    hashWithSalt salt x
         | isIEEE x =
             assert (sizeOf x >= sizeOf (0::Word64) &&
                     alignment x >= alignment (0::Word64)) $
-            hash ((unsafePerformIO $ with x $ peek . castPtr) :: Word64)
-        | otherwise = hash (show x)
+            hashWithSalt salt ((unsafePerformIO $ with x $ peek . castPtr) :: Word64)
+        | otherwise = hashWithSalt salt $ show x
 
-instance Hashable Char where hash = fromEnum
+instance Hashable Char where
+    hashWithSalt salt = combine salt . fromEnum
 
 -- | A value with bit pattern (01)* (or 5* in hexa), for any size of Int.
 -- It is used as data constructor distinguisher. GHC computes its value during
@@ -285,7 +353,7 @@ instance (Hashable a1, Hashable a2, Hashable a3, Hashable a4, Hashable a5,
 
 #if defined(__GLASGOW_HASKELL__) || defined(__HUGS__)
 instance Hashable (StableName a) where
-    hash = hashStableName
+    hashWithSalt salt = combine salt . hashStableName
 #endif
 
 instance Hashable a => Hashable [a] where
@@ -323,7 +391,7 @@ hashThreadId = hash . show
 #endif
 
 instance Hashable ThreadId where
-    hash = hashThreadId
+    hashWithSalt salt = combine salt . hashThreadId
     {-# INLINE hash #-}
 
 
@@ -340,7 +408,7 @@ hashTypeRep = hash . show
 #endif
 
 instance Hashable TypeRep where
-    hash = hashTypeRep
+    hashWithSalt salt = combine salt . hashTypeRep
     {-# INLINE hash #-}
 
 
